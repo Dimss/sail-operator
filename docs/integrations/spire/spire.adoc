@@ -1,0 +1,252 @@
+== SPIRE and Red Hat's Zero Trust Workload Identity
+
+=== Spiffe and SPIRE
+Spire is a production-ready implementation of the https://spiffe.io/[SPIFFE] specification
+that performs node and workload attestation in order to securely issue
+cryptographic identities to workloads running in heterogeneous environments.
+SPIRE can be configured as a source of cryptographic identities for Istio
+workloads through an integration with Envoy’s SDS API.
+Istio can detect the existence of a UNIX Domain
+Socket that implements the Envoy SDS API on a defined socket path,
+allowing Envoy to communicate and fetch identities directly from it.
+
+This integration with SPIRE provides flexible attestation options not
+available with the default Istio identity management while harnessing Istio’s
+powerful service management. For example,
+SPIRE’s plugin architecture enables diverse workload attestation options
+beyond the Kubernetes namespace and service account attestation offered by Istio.
+SPIRE’s node attestation extends attestation to the physical or virtual hardware on
+which workloads run.
+
+=== Red Hat's Zero Trust Workload Identity Manager (ZTWIM)
+https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/security_and_compliance/zero-trust-workload-identity-manager#zero-trust-manager-spire-agent-config_zero-trust-manager-configuration[ZTWIM] is a Red Hat OpenShift operator that uses the
+open-source SPIFFE/SPIRE framework to automate the creation,
+rotation, and management of secure, verifiable identities for workloads.
+
+* <<installation,Installation>>
+** <<ztwim-installation,Zero Trust Workload Identity Manager (ZTWIM)>>
+*** <<ztwim-deploy-operator,Deploy ZTWIM Operator>>
+*** <<ztwim-deploy-operands,Deploy ZTWIM Operands (CRs)>>
+**** <<spire-server,Create SpireServer CR>>
+**** <<spire-agent,Create SpireAgent CR>>
+**** <<patch-spire-agent-configmap,Patch Spire Agent ConfigMap>>
+**** <<csi-driver,Create SpiffeCSIDriver CR>>
+**** <<oidc-discovery,Create SpireOIDCDiscoveryProvider CR>>
+**** <<verify-ztwim-installation,Verify ZTWIM installation>>
+**** <<note-abot-spire-agent-socket-name,Note about Spire Agent Socket name>>
+** <<istio,Istio>>
+
+
+[[installation]]
+[[ztwim-installation]]
+=== Zero Trust Workload Identity Manager (ZTWIM)
+
+[[ztwim-deploy-operator]]
+==== Deploying ZTWIM Operator
+The official ZTWIM installation documentations is https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/security_and_compliance/zero-trust-workload-identity-manager#zero-trust-manager-how-it-works_zero-trust-manager-overview[here].
+However, to make it works with Istio we'll need to patch a bit deployment manifests.
+Deploy ZTWIM operator only (without any *operands*) as described
+in the official ZTWIM docs https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/security_and_compliance/zero-trust-workload-identity-manager#zero-trust-manager-install[10.3. Installing the Zero Trust Workload Identity Manager]
+
+[[ztwim-deploy-operands]]
+==== Deploying ZTWIM Operands
+[[spire-server]]
+Set https://spiffe.io/docs/latest/spiffe-about/spiffe-concepts/#trust-domain[Spiffe Trust Domain]
+and deploy https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/security_and_compliance/zero-trust-workload-identity-manager#zero-trust-manager-spire-server-config_zero-trust-manager-configuration[SpireServer]
+[source,bash]
+----
+export TRUST_DOMAIN=ocp.one
+----
+
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpireServer
+metadata:
+  name: cluster
+spec:
+  trustDomain: $TRUST_DOMAIN
+  clusterName: spiffe-eval
+  caSubject:
+    commonName: spiffe-eval
+    country: "US"
+    organization: "RH"
+  persistence:
+    type: pvc
+    size: "5Gi"
+    accessMode: ReadWriteOnce
+  datastore:
+    databaseType: sqlite3
+    connectionString: "/run/spire/data/datastore.sqlite3"
+    maxOpenConns: 100
+    maxIdleConns: 2
+    connMaxLifetime: 3600
+  jwtIssuer: https://oidc-discovery.$TRUST_DOMAIN
+EOF
+----
+Make sure the Spire Server is up and running
+[source,bash]
+----
+oc get statefulset -l app.kubernetes.io/name=spire-server -n zero-trust-workload-identity-manager
+----
+[[spire-agent]]
+Deploy https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/security_and_compliance/zero-trust-workload-identity-manager#zero-trust-manager-spire-agent-config_zero-trust-manager-configuration[SPIRE Agent].
+One of the important additions here is the `ztwim.openshift.io/create-only: "true"`.
+Once the Agent will be running, and for being able to integrate Istio with them,
+will have to rename the Spire Agent socket name. To achieve this, we must set
+`ztwim.openshift.io/create-only: "true"` and patch the Spire Agent config map once
+all the agent has been deployed.
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpireAgent
+metadata:
+  name: cluster
+  annotations:
+    ztwim.openshift.io/create-only: "true"
+spec:
+  trustDomain: $TRUST_DOMAIN
+  clusterName: spiffe-eval
+  nodeAttestor:
+    k8sPSATEnabled: "true"
+  workloadAttestors:
+    k8sEnabled: "true"
+    workloadAttestorsVerification:
+      type: "auto"
+EOF
+----
+Make sure all the Spire Agent pods are running:
+[source,bash]
+----
+oc get daemonset -l app.kubernetes.io/name=spire-agent -n zero-trust-workload-identity-manager
+----
+[[patch-spire-agent-configmap]]
+Patch the Spire Agent config map, and change the agent socket path value from
+`"socket_path": "/tmp/spire-agent/public/spire-agent.sock"` to `"socket_path": "/tmp/spire-agent/public/socket"`
+This will allow Istio's proxy (Envoy) to properly discover (SDS) Spiffe Workload API socket
+[source,bash]
+----
+kubectl patch \
+ configmap spire-agent -nzero-trust-workload-identity-manager \
+-p "$(kubectl get configmap spire-agent  \
+-nzero-trust-workload-identity-manager -o json | \
+ jq '{data: {"agent.conf": (.data."agent.conf" | fromjson | .agent.socket_path = "/tmp/spire-agent/public/socket" | tostring)}}')"
+----
+[[csi-driver]]
+Deploy https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/security_and_compliance/zero-trust-workload-identity-manager#zero-trust-manager-spire-csidriver-config_zero-trust-manager-configuration[SpiffeCSIDriver]
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpiffeCSIDriver
+metadata:
+  name: cluster
+spec:
+  agentSocketPath: '/run/spire/agent-sockets/socket'
+EOF
+----
+Note, that in `agentSocketPath` the *socket file name* /run/spire/agent-sockets/`socket`
+now match to what we defined in
+Spire Agent configmap /tmp/spire-agent/public/`socket`
+Make sure all the Spiffe SCIDriver pods are running:
+[srouce,bash]
+----
+oc get daemonset -l app.kubernetes.io/name=spiffe-csi-driver -n zero-trust-workload-identity-manager
+----
+[[oidc-discovery]]
+Deploy https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/security_and_compliance/zero-trust-workload-identity-manager#zero-trust-manager-oidc-config_zero-trust-manager-configuration[SpireOIDCDiscoveryProvider]
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpireOIDCDiscoveryProvider
+metadata:
+  name: cluster
+spec:
+  trustDomain: $TRUST_DOMAIN
+  agentSocketName: 'socket'
+  jwtIssuer: https://oidc-discovery.$TRUST_DOMAIN
+EOF
+----
+Note, that the `agentSocketName` is `socket` and it is
+the same name as was defined in Spire Agent and Spiffe SCI Driver.
+Make sure spire SpireOIDCDiscoveryProvider
+[source,bash]
+----
+oc get deployment spire-spiffe-oidc-discovery-provider -n zero-trust-workload-identity-manager
+----
+[[verify-ztwim-installation]]
+To verify ZTWIM installation, deploy client workload and try to fetch workload SVID
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  labels:
+    app: client
+spec:
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: client
+          image: ghcr.io/spiffe/spire-agent:1.5.1
+          command: ["/opt/spire/bin/spire-agent"]
+          args: [ "api", "watch",  "-socketPath", "/run/spire/sockets/socket" ]
+          volumeMounts:
+            - mountPath: /run/spire/sockets
+              name: spiffe-workload-api
+              readOnly: true
+      volumes:
+      - name: spiffe-workload-api
+        csi:
+          driver: csi.spiffe.io
+          readOnly: true
+EOF
+----
+Once the client pod is running try to fetch the SVID
+[source,bash]
+----
+kubectl exec -it \
+$(kubectl get pods -o=jsonpath='{.items[0].metadata.name}' -l app=client) \
+ -- /opt/spire/bin/spire-agent api fetch -socketPath /run/spire/sockets/socket
+----
+If ZTWIM was deployed and configured correctly, you should get something like this
+[source,text]
+----
+Received 1 svid after 29.636075ms
+
+SPIFFE ID:		spiffe://ocp.one/ns/default/sa/default
+SVID Valid After:	 2025-10-21 14:04:03 +0000 UTC
+SVID Valid Until:	 2025-10-21 15:04:13 +0000 UTC
+CA #1 Valid After:	2025-10-21 07:38:03 +0000 UTC
+CA #1 Valid Until:	2025-10-22 07:38:13 +0000 UTC
+----
+[[note-abot-spire-agent-socket-name]]
+_A note about the Spire Agent socket name.
+{empty} +
+Istio SDS server has static convention where to expect for the SDS socket.
+https://github.com/istio/istio/blob/master/pkg/security/security.go#L50[WorkloadIdentityPath]
+https://github.com/istio/istio/blob/master/pkg/security/security.go#L54C2-L54C35[DefaultWorkloadIdentitySocketFile]
+https://github.com/istio/istio/blob/master/pkg/security/security.go#L516[GetIstioSDSServerSocketPath()]
+Spiffe.io team aware that different workloads might have
+different requirements for spire-agent socket naming convention.
+To provide standardization and compatibility,
+spire-agent helm chart expose https://github.com/spiffe/helm-charts-hardened/blob/main/charts/spire/charts/spire-agent/values.yaml#L286[socketAlternate.names]
+param which is responsible for creation of alternate names for
+the spire-agent socket.
+However, as for the Tech Preview of the ZTWIM socketAlternate.names aren't supported yet.
+Thus, we must patch the Spire socket name is that way._
+
+[[istio]]
+=== Istio
+The istio deployemd
