@@ -41,6 +41,9 @@ rotation, and management of secure, verifiable identities for workloads.
 *** <<verify-istio-installation,Verify Istio Installation with ZTWIM>>
 ** <<simple-istio-mutual-with-spire,Simple ISTIO_MUTUAL with Spire>>
 ** <<connecting-external-services-to-the-mesh,Connect external services to the Mesh >>
+** <<ingress-gateway,Istio Ingress Gateway with SPIFFE >>
+** <<bookinfo-app,Bookinfo App example with SPIFFE>>
+
 
 
 [[installation]]
@@ -561,6 +564,7 @@ kubectl exec $CURL_POD -n test-1 -it -- curl -s -o /dev/null -w "%{http_code}" h
 If you received HTTP 200 code, meaning your mesh configured with Spire correctly.
 Both services are able to fetch Spiffe https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md[SVID x509],
 they trust each other identities and can talk to each other securely.
+
 [[connecting-external-services-to-the-mesh]]
 === Connecting external service to the mesh
 Spire issuing SVIDs over Workload API.
@@ -574,7 +578,7 @@ In the following steps we'll deploy a new workload,
 outside the mesh, (without Istio sidecar), and we'll try
 to communicate to services within the mesh.
 
-Create namespace, note this time we are explicitly
+Create namespace, this time we are explicitly
 disabling istio sidecar injection with label `istio-injection=disabled`
 [source,bash]
 ----
@@ -582,6 +586,60 @@ kubectl create namespace test-2
 kubectl label namespace test-2 istio-injection=disabled
 ----
 
+_Note, for external client we'll be using curl command.
+Curl is not a native SPIFFE application, thus to make curl
+(or any other non-native SPIFFE workload) work with our
+service mesh services, we'll need to config the `ClusterSPIFFEID` to include
+SANs into x509 SVID._
+
+Patch the default ClusterSPIFFEID
+`zero-trust-workload-identity-manager-spire-default`
+and exclude `test-1` and `test-2` namespaces.
+We'll create a dedicated `ClusterSPIFFEID` later.
+[source,bash]
+----
+kubectl patch clusterspiffeid zero-trust-workload-identity-manager-spire-default --type='json' -p='[
+    {
+      "op": "replace",
+      "path": "/spec/namespaceSelector/matchExpressions/0/values",
+      "value": [
+        "zero-trust-workload-identity-manager",
+        "test-1",
+        "test-2"
+      ]
+    }
+]'
+----
+Create a new `ClusterSPIFFEID` for service in test-1 and test-2 namespaces.
+
+_Note, we are adding `autoPopulateDNSNames: true`
+This will instruct  Spire server to includes SANs into x509 SVID_
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: curl-test-2
+spec:
+  autoPopulateDNSNames: true
+  className: zero-trust-workload-identity-manager-spire
+  fallback: true
+  hint: curl
+  jwtTtl: 0s
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: In
+      values:
+      - test-1
+      - test-2
+  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{.PodSpec.ServiceAccountName }}"
+  ttl: 0s
+  dnsNameTemplates:
+    - "curl.{{ .TrustDomain }}"
+EOF
+----
 Deploy `curl` workload, note this time we need explicitly use Spiffe CSI volume.
 [source,bash]
 ----
@@ -636,59 +694,290 @@ spec:
           readOnly: true
 EOF
 ----
-Patch the default ClusterSPIFFEID `zero-trust-workload-identity-manager-spire-default`
-[source,bash]
-----
-# patch the ClusterSPIFFEID here disable for test-1 and for test-2
-----
-Create ClusterSPIFFEID for service in test-1 and test-2 curl service in
-[source,bash]
-----
-cat <<EOF | kubectl apply -f -
-apiVersion: spire.spiffe.io/v1alpha1
-kind: ClusterSPIFFEID
-metadata:
-  name: curl-test-2
-spec:
-  autoPopulateDNSNames: true
-  className: zero-trust-workload-identity-manager-spire
-  fallback: true
-  hint: curl
-  jwtTtl: 0s
-  namespaceSelector:
-    matchExpressions:
-    - key: kubernetes.io/metadata.name
-      operator: In
-      values:
-      - test-1
-      - test-2
-  spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/ns/{{ .PodMeta.Namespace }}/sa/{{.PodSpec.ServiceAccountName }}"
-  ttl: 0s
-  dnsNameTemplates:
-    - "curl.{{ .TrustDomain }}"
-EOF
-----
+
 Make a direct HTTP request to the within mesh service, to the outside mesh service
 [source,bash]
 ----
+# get curl pod name
 CURL_POD=$(kubectl get pod -l app=curl -ntest-2 -o jsonpath="{.items[0].metadata.name}")
+
 # fetch x509 SVID and store them on the disk
-kubectl exec $CURL_POD -n test-2 \
-  -it -- /tmp/spire-agent api fetch x509 -socketPath /tmp/spiffe-socket/socket  -write /tmp
+kubectl exec $CURL_POD -n test-2 -it -- \
+  /tmp/spire-agent api \
+  fetch x509 \
+  -socketPath /tmp/spiffe-socket/socket \
+  -write /tmp
+
 # making direct request to the service withing the mesh from outside mesh service
-kubectl exec $CURL_POD -n test-2 \
-  -it -- curl -s -o /dev/null -w "%{http_code}" --insecure --key /tmp/svid.0.key --cert /tmp/svid.0.pem  https://httpbin.test-1.svc
+kubectl exec $CURL_POD -n test-2 -it -- \
+  curl -s -o /dev/null -w "%{http_code}" \
+  https://httpbin.test-1.svc \
+  --key /tmp/svid.0.key \
+  --cert /tmp/svid.0.pem \
+  --cacert /tmp/bundle.0.pem
 ----
-A note about `--insecure` flag.
-The reason for making an insecure request, is because `curl`
-does not natively support SPIFFE protocol.
-Which means, it's not capable to validate httpbin x509 SVID.
-For production use cases, you either should implement
-https://github.com/spiffe/go-spiffe[Spiffe SKD]
-or use some third parity solutions who implement SPIFFE protocol
+
+If you received HTTP 200 code,
+meaning you were able to connect external service to  the mesh services.
+Both services are able to fetch Spiffe SVID x509,
+they trust each other identities and can talk to each other securely.
+
+_A note about native SPIFFE workloads. Istio sidecar (Envoy) is one
+of the examples of SPIFFE native workloads.
+There are many other tools that implements SPIFFE. one of the ways
+to add native spiffe support for your application is to
+use https://github.com/spiffe/go-spiffe[Spiffe SKD],
+or some third parity solutions who implement SPIFFE protocol
 like https://github.com/ghostunnel/ghostunnel[Ghostunnel].
-More info https://spiffe.io/docs/latest/deploying/svids/[here]
-Another option to overcome the compatibility problem could be
-DNS SANs into SVID. This can be accomplished by modifying
-Spire Agent configuration and enable this feature.
+More info https://spiffe.io/docs/latest/deploying/svids/[here]_
+
+[[ingress-gateway]]
+=== Ingress Gateway
+
+Deploy Istio Ingress Gateway
+
+_Note the `inject.istio.io/templates` includes both `gateway` and `spire`
+templates. `spire` templates is required so the Spire Agent socket will be
+mounted automatically to the Istio Ingress Gateway pod_
+
+[source,bash]
+----
+
+# allow istio ingress pod to run with anyuid
+oc adm policy add-scc-to-user anyuid system:serviceaccount:istio-system:istio-gateway
+
+# install the istio gateway helm chart
+helm install istio-gateway -nistio-system  istio/gateway \
+ --set-json 'podAnnotations={"inject.istio.io/templates":"gateway,spire"}'
+----
+Make sure the istio gateway is up and running
+[source,bash]
+----
+kubectl get deploy istio-gateway -nistio-system
+----
+Create Istio Gateway CR for `httpbin` service in `test-1` namespace
+[source,bash]
+----
+export LB_IP=$(kubectl get svc istio-gateway -nistio-system -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
+
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: httpbin-gateway
+  namespace: test-1
+spec:
+  selector:
+    istio: gateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "httpbin.$LB_IP.nip.io"
+EOF
+----
+
+Create Istio Virtual Service for `httpbin` service.
+No need to create `DestinationRules`, we created it in previous steps.
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: httpbin
+  namespace: test-1
+spec:
+  hosts:
+    - httpbin.$LB_IP.nip.io
+  gateways:
+    - httpbin-gateway
+  http:
+    - route:
+      - destination:
+          host: httpbin.test-1.svc.cluster.local
+          port:
+            number: 80
+EOF
+----
+
+Make a http call to the httpbin service
+[source,bash]
+----
+curl httpbin.10.0.197.91.nip.io \
+ -s -o /dev/null -w "%{http_code}"
+----
+If you received HTTP 200 code,
+meaning you traffic is securely routed from the Istio Gateway pod
+to httpbin using mTLS connection.
+
+[[bookinfo-app]]
+=== Bookinfo app with SPIFFE
+No need to create a namespace for Bookinfo app since we'll be using the `default` namespace.
+We do need to label `default` namespace to enable automatic sidecar injection
+[source,bash]
+----
+kubectl label namespace default istio-injection=enabled
+----
+
+Deploy Bookinfo App from this xref:resources/bookinfo.yaml[manifest]
+[source,bash]
+----
+kubectl create -f resources/bookinfo.yaml
+----
+
+Verify all Bookinfo workloads are up and running
+[source,bash]
+----
+kubectl get deployment
+----
+
+Deploy Istio Virtual Service and Gateway CRs for the Bookinfo App.
+Do not forget to export the `LB_IP` as mentioned previously
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: bookinfo-gateway
+  namespace: default
+spec:
+  selector:
+    istio: gateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "bookinfo.$LB_IP.nip.io"
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: bookinfo
+  namespace: default
+spec:
+  hosts:
+    - "bookinfo.$LB_IP.nip.io"
+  gateways:
+    - bookinfo-gateway
+  http:
+    - match:
+        - uri:
+            exact: /productpage
+        - uri:
+            prefix: /static
+        - uri:
+            exact: /login
+        - uri:
+            exact: /logout
+        - uri:
+            prefix: /api/v1/products
+      route:
+        - destination:
+            host: productpage.default.svc.cluster.local
+            port:
+              number: 9080
+EOF
+----
+Try to access the Bookinfo app with curl
+[source,bash]
+----
+curl http://bookinfo.$LB_IP.nip.io/productpage  -s -o /dev/null -w "%{http_code}"
+----
+Or with Web Browser go to `http://bookinfo.$LB_IP.nip.io/productpage`,
+if everything was configured correctly you
+should get the product page of the Bookinfo app
+
+Add Bookinfo app `DestinationRules` and set tls mode to ISTIO_MUTUAL
+[source,bash]
+----
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: productpage
+spec:
+  host: productpage
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: reviews
+spec:
+  host: reviews
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+    - name: v3
+      labels:
+        version: v3
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: ratings
+spec:
+  host: ratings
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+    - name: v2-mysql
+      labels:
+        version: v2-mysql
+    - name: v2-mysql-vm
+      labels:
+        version: v2-mysql-vm
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: details
+spec:
+  host: details
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+  subsets:
+    - name: v1
+      labels:
+        version: v1
+    - name: v2
+      labels:
+        version: v2
+EOF
+----
+If everything was configured correctly,
+you will be able to successfully access the bookinfo page.
+This means that your within the mesh services are able to
+talk to each other with mTLS by using SPIFFE x509 SVIDs.
+
+
+
+
 
